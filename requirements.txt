@@ -1,19 +1,17 @@
 import streamlit as st
 import pandas as pd
-import anthropic
 import json
 import io
 import re
+import requests
 
 st.set_page_config(page_title="Actualizador Stock Etiquetas", page_icon="🍷", layout="wide")
 
 st.title("🍷 Actualizar stock de vino en previsión de etiquetas")
 st.markdown("La IA relaciona las ETQ/CONTRA (col. B etiquetas) con los vinos (col. C stock) y copia el stock disponible (col. F) a la columna D del excel de etiquetas.")
 
-# --- API KEY ---
 api_key = st.text_input("🔑 API Key de Anthropic (sk-ant-...)", type="password", placeholder="sk-ant-api03-...")
 
-# --- CARGA DE ARCHIVOS ---
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("📋 Excel de etiquetas")
@@ -23,16 +21,14 @@ with col2:
     file_vino = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx", "xls"], key="vino")
 
 def parse_etq(file):
-    df = pd.read_excel(file, header=0)
-    rows = []
     raw = pd.read_excel(file, header=None)
+    rows = []
     for i in range(1, len(raw)):
-        name = str(raw.iloc[i, 1] or '').strip()
-        if not name:
+        name = str(raw.iloc[i, 1] if len(raw.columns) > 1 else '').strip()
+        if not name or name == 'nan':
             continue
         stock_etq = raw.iloc[i, 2] if len(raw.columns) > 2 else ''
-        stock_vino = raw.iloc[i, 3] if len(raw.columns) > 3 else ''
-        rows.append({"row_idx": i + 1, "name": name, "stock_etq": stock_etq, "stock_vino": stock_vino})
+        rows.append({"row_idx": i + 1, "name": name, "stock_etq": stock_etq})
     return rows
 
 def parse_vino(file):
@@ -40,7 +36,7 @@ def parse_vino(file):
     rows = []
     for i in range(len(raw)):
         name = str(raw.iloc[i, 2] if len(raw.columns) > 2 else '').strip()
-        if not name or name == 'Nombre':
+        if not name or name in ('Nombre', 'nan'):
             continue
         raw_stock = raw.iloc[i, 5] if len(raw.columns) > 5 else None
         if raw_stock is None or str(raw_stock).strip() in ('', '-', 'nan'):
@@ -53,38 +49,49 @@ def parse_vino(file):
     return rows
 
 def call_claude(api_key, prompt):
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}]
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 2000,
+            "messages": [{"role": "user", "content": prompt}]
+        },
+        timeout=60
     )
-    return msg.content[0].text.strip()
+    if not resp.ok:
+        raise Exception(f"API {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    return data["content"][0]["text"].strip()
 
 if file_etq and file_vino:
+    file_etq.seek(0)
+    file_vino.seek(0)
     etq_rows = parse_etq(file_etq)
+    file_vino.seek(0)
     vino_rows = parse_vino(file_vino)
 
     st.success(f"✅ Excel etiquetas: **{len(etq_rows)}** artículos · Excel vino: **{len(vino_rows)}** vinos con stock")
 
     if st.button("🤖 Buscar coincidencias con IA", type="primary", disabled=not api_key):
-        if not api_key:
-            st.error("Introduce tu API key primero.")
-        else:
-            vino_names = [v["name"] for v in vino_rows]
-            etq_names = [r["name"] for r in etq_rows]
-            all_results = {}
-            BATCH = 35
+        vino_names = [v["name"] for v in vino_rows]
+        etq_names = [r["name"] for r in etq_rows]
+        all_results = {}
+        BATCH = 35
+        progress = st.progress(0, text="Iniciando análisis...")
+        total_batches = (len(etq_names) + BATCH - 1) // BATCH
+        error_found = False
 
-            progress = st.progress(0, text="Iniciando análisis...")
-            total_batches = (len(etq_names) + BATCH - 1) // BATCH
+        for b, i in enumerate(range(0, len(etq_names), BATCH)):
+            batch = etq_names[i:i+BATCH]
+            pct = int((b / total_batches) * 90)
+            progress.progress(pct, text=f"Lote {b+1} de {total_batches} — artículos {i+1}–{min(i+BATCH, len(etq_names))} de {len(etq_names)}")
 
-            for b, i in enumerate(range(0, len(etq_names), BATCH)):
-                batch = etq_names[i:i+BATCH]
-                pct = int((b / total_batches) * 90)
-                progress.progress(pct, text=f"Lote {b+1} de {total_batches} — artículos {i+1}–{min(i+BATCH, len(etq_names))} de {len(etq_names)}")
-
-                prompt = f"""Eres experto en vinos de Ego Bodegas. Relaciona cada etiqueta/contra con el vino del inventario.
+            prompt = f"""Eres experto en vinos de Ego Bodegas. Relaciona cada etiqueta/contra con el vino del inventario.
 
 REGLAS:
 - Ignora prefijos ETQ/CONTRA al comparar
@@ -105,20 +112,21 @@ ETIQUETAS:
 VINOS CON STOCK DISPONIBLE:
 {chr(10).join(vino_names)}"""
 
-                try:
-                    text = call_claude(api_key, prompt)
-                    text = re.sub(r'```json|```', '', text).strip()
-                    m = re.search(r'\[[\s\S]*\]', text)
-                    parsed = json.loads(m.group(0) if m else text)
-                    for p in parsed:
-                        all_results[p["etq"]] = p
-                except Exception as e:
-                    st.error(f"❌ Error en lote {b+1}: {e}")
-                    break
+            try:
+                text = call_claude(api_key, prompt)
+                text = re.sub(r'```json|```', '', text).strip()
+                m = re.search(r'\[[\s\S]*\]', text)
+                parsed = json.loads(m.group(0) if m else text)
+                for p in parsed:
+                    all_results[p["etq"]] = p
+            except Exception as e:
+                st.error(f"❌ Error en lote {b+1}: {e}")
+                error_found = True
+                break
 
+        if not error_found:
             progress.progress(95, text="Cruzando datos...")
             vino_map = {v["name"]: v for v in vino_rows}
-
             matches = []
             for etq in etq_rows:
                 m = all_results.get(etq["name"], {})
@@ -130,11 +138,9 @@ VINOS CON STOCK DISPONIBLE:
                     "matched_stock": vino_entry["stock"] if vino_entry else None,
                     "conf": m.get("conf", "low") if vino_name else "skip"
                 })
-
             progress.progress(100, text="¡Completado!")
             st.session_state["matches"] = matches
             st.session_state["vino_rows"] = vino_rows
-            st.session_state["etq_file"] = file_etq
 
 if "matches" in st.session_state:
     matches = st.session_state["matches"]
@@ -148,18 +154,17 @@ if "matches" in st.session_state:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total artículos", len(matches))
     c2.metric("✅ Coincidencia alta", high)
-    c3.metric("⚠️ Coincidencia media", mid)
+    c3.metric("⚠️ Media", mid)
     c4.metric("❌ Sin coincidencia", low)
 
     st.markdown("### Revisa y corrige las coincidencias")
-
-    conf_filter = st.selectbox("Filtrar por confianza", ["Todas", "Alta (high)", "Media (mid)", "Revisar (low/skip)", "Manual"])
+    conf_filter = st.selectbox("Filtrar por confianza", ["Todas", "Alta", "Media", "Revisar", "Manual"])
     search = st.text_input("Buscar etiqueta...")
 
-    conf_map = {"Todas": None, "Alta (high)": "high", "Media (mid)": "mid", "Revisar (low/skip)": "low_skip", "Manual": "manual"}
-    cf = conf_map[conf_filter]
-
     vino_options = ["— sin asignar —"] + [v["name"] for v in vino_rows]
+    CONF_LABELS = {"high": "✅ Alta", "mid": "⚠️ Media", "low": "❌ Revisar", "skip": "— Sin asignar", "manual": "✏️ Manual"}
+    CONF_FILTER_MAP = {"Todas": None, "Alta": "high", "Media": "mid", "Revisar": "low_skip", "Manual": "manual"}
+    cf = CONF_FILTER_MAP[conf_filter]
 
     filtered = []
     for i, m in enumerate(matches):
@@ -171,49 +176,42 @@ if "matches" in st.session_state:
             continue
         filtered.append((i, m))
 
-    CONF_LABELS = {"high": "✅ Alta", "mid": "⚠️ Media", "low": "❌ Revisar", "skip": "— Sin asignar", "manual": "✏️ Manual"}
-
     for i, m in filtered:
         cols = st.columns([3, 1, 1, 3, 1])
         cols[0].markdown(f"**{m['name']}**")
         cols[1].markdown(f"`{m.get('stock_etq', '—')}`")
         cols[2].markdown(CONF_LABELS.get(m["conf"], m["conf"]))
-
         current_vino = m.get("matched_vino") or "— sin asignar —"
         idx = vino_options.index(current_vino) if current_vino in vino_options else 0
         selected = cols[3].selectbox("", vino_options, index=idx, key=f"sel_{i}", label_visibility="collapsed")
-
         if selected != current_vino:
             matches[i]["matched_vino"] = selected if selected != "— sin asignar —" else None
             matches[i]["conf"] = "manual" if selected != "— sin asignar —" else "skip"
             vino_entry = next((v for v in vino_rows if v["name"] == selected), None)
             matches[i]["matched_stock"] = vino_entry["stock"] if vino_entry else None
             st.session_state["matches"] = matches
-
         sv = m.get("matched_stock")
         cols[4].markdown(f"`{int(sv) if sv is not None else '—'}`")
 
     st.markdown("---")
-    if st.button("⬇️ Descargar Excel actualizado", type="primary"):
-        file_etq = st.session_state["etq_file"]
-        file_etq.seek(0)
-        raw = pd.read_excel(file_etq, header=None)
-
-        updated = 0
-        for m in matches:
-            if m.get("matched_stock") is not None:
-                row_i = m["row_idx"] - 1
-                raw.iloc[row_i, 3] = m["matched_stock"]
-                updated += 1
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            raw.to_excel(writer, index=False, header=False)
-        output.seek(0)
-
-        st.download_button(
-            label=f"📥 Descargar ({updated} celdas actualizadas)",
-            data=output,
-            file_name="previsión_etiquetas_2026_ACTUALIZADO.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    if st.button("⬇️ Generar Excel actualizado", type="primary"):
+        if file_etq is not None:
+            file_etq.seek(0)
+            raw = pd.read_excel(file_etq, header=None)
+            updated = 0
+            for m in matches:
+                if m.get("matched_stock") is not None:
+                    raw.iloc[m["row_idx"] - 1, 3] = m["matched_stock"]
+                    updated += 1
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                raw.to_excel(writer, index=False, header=False)
+            output.seek(0)
+            st.download_button(
+                label=f"📥 Descargar ({updated} celdas actualizadas en col. D)",
+                data=output,
+                file_name="previsión_etiquetas_2026_ACTUALIZADO.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("Vuelve a cargar el excel de etiquetas para poder descargar.")
