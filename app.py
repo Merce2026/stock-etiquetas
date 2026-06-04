@@ -15,8 +15,8 @@ api_key = st.text_input("🔑 API Key de Anthropic (sk-ant-...)", type="password
 st.markdown("---")
 tab1, tab2 = st.tabs(["🏢 Empresa 1 (Hoja 1)", "🏡 Finca (Hoja 2)"])
 
-def parse_etq(file, sheet):
-    raw = pd.read_excel(file, header=None, sheet_name=sheet)
+def parse_etq(file, sheet_index):
+    raw = pd.read_excel(file, header=None, sheet_name=sheet_index)
     rows = []
     for i in range(1, len(raw)):
         name = str(raw.iloc[i, 1] if len(raw.columns) > 1 else '').strip()
@@ -63,7 +63,7 @@ def call_claude(api_key, prompt):
     data = resp.json()
     return data["content"][0]["text"].strip()
 
-def run_matching(tab_key, file_etq, sheet_name, file_vino, api_key):
+def run_matching(tab_key, file_etq, sheet_index, sheet_label, file_vino, api_key):
     if not file_etq or not file_vino:
         st.info("Carga ambos excels para continuar.")
         return
@@ -72,13 +72,13 @@ def run_matching(tab_key, file_etq, sheet_name, file_vino, api_key):
     file_vino.seek(0)
 
     try:
-        etq_rows = parse_etq(file_etq, sheet_name)
+        etq_rows = parse_etq(file_etq, sheet_index)
     except Exception as e:
-        st.error(f"Error leyendo hoja '{sheet_name}' del excel de etiquetas: {e}")
+        st.error(f"Error leyendo hoja '{sheet_label}' del excel de etiquetas: {e}")
         return
 
     vino_rows = parse_vino(file_vino)
-    st.success(f"✅ Etiquetas ({sheet_name}): **{len(etq_rows)}** artículos · Vino: **{len(vino_rows)}** vinos con stock")
+    st.success(f"✅ Etiquetas ({sheet_label}): **{len(etq_rows)}** artículos · Vino: **{len(vino_rows)}** vinos con stock")
 
     if st.button("🤖 Buscar coincidencias con IA", type="primary", disabled=not api_key, key=f"btn_match_{tab_key}"):
         vino_names = [v["name"] for v in vino_rows]
@@ -105,6 +105,7 @@ REGLAS:
 - Para etiquetas sin año (S/A), asigna el vino más reciente disponible
 - Si no hay ninguna coincidencia razonable pon null
 - conf: "high"=coincidencia clara, "mid"=probable, "low"=dudosa
+- El campo "vino" debe ser el nombre EXACTAMENTE igual a como aparece en la lista de abajo, sin cambiar ni una letra
 
 Responde SOLO con el JSON array sin texto ni backticks:
 [{{"etq":"nombre exacto","vino":"nombre exacto del vino o null","conf":"high/mid/low"}}]
@@ -112,7 +113,7 @@ Responde SOLO con el JSON array sin texto ni backticks:
 ETIQUETAS:
 {chr(10).join(batch)}
 
-VINOS CON STOCK DISPONIBLE:
+VINOS CON STOCK DISPONIBLE (copia el nombre exactamente):
 {chr(10).join(vino_names)}"""
 
             try:
@@ -134,12 +135,15 @@ VINOS CON STOCK DISPONIBLE:
             for etq in etq_rows:
                 m = all_results.get(etq["name"], {})
                 vino_name = m.get("vino")
-                vino_entry = vino_map.get(vino_name) if vino_name else None
+                # Búsqueda exacta primero, luego insensible a mayúsculas
+                vino_entry = vino_map.get(vino_name)
+                if not vino_entry and vino_name:
+                    vino_entry = next((v for v in vino_rows if v["name"].strip().lower() == vino_name.strip().lower()), None)
                 matches.append({
                     **etq,
-                    "matched_vino": vino_name,
+                    "matched_vino": vino_entry["name"] if vino_entry else None,
                     "matched_stock": vino_entry["stock"] if vino_entry else None,
-                    "conf": m.get("conf", "low") if vino_name else "skip"
+                    "conf": m.get("conf", "low") if vino_entry else "skip"
                 })
             progress.progress(100, text="¡Completado!")
             st.session_state[f"matches_{tab_key}"] = matches
@@ -199,25 +203,22 @@ VINOS CON STOCK DISPONIBLE:
         st.markdown("---")
         if st.button("⬇️ Generar Excel actualizado", type="primary", key=f"btn_download_{tab_key}"):
             file_etq.seek(0)
-            # Leer todas las hojas para preservarlas
             all_sheets = pd.read_excel(file_etq, header=None, sheet_name=None)
-            # Actualizar la hoja correspondiente
-            raw = all_sheets[sheet_name]
+            sheet_names = list(all_sheets.keys())
+            raw = all_sheets[sheet_names[sheet_index]]
             updated = 0
             for m in matches:
                 if m.get("matched_stock") is not None:
                     raw.iloc[m["row_idx"] - 1, 3] = m["matched_stock"]
                     updated += 1
-            all_sheets[sheet_name] = raw
-
+            all_sheets[sheet_names[sheet_index]] = raw
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 for sname, sdf in all_sheets.items():
                     sdf.to_excel(writer, index=False, header=False, sheet_name=sname)
             output.seek(0)
-
             st.download_button(
-                label=f"📥 Descargar ({updated} celdas actualizadas en col. D — hoja {sheet_name})",
+                label=f"📥 Descargar ({updated} celdas actualizadas en col. D — {sheet_label})",
                 data=output,
                 file_name=f"previsión_etiquetas_2026_ACTUALIZADO_{tab_key}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -236,13 +237,13 @@ with tab1:
         file_vino1 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino1")
 
     if file_etq1 and file_vino1 and api_key:
-        run_matching("emp1", file_etq1, 0, file_vino1, api_key)
+        run_matching("emp1", file_etq1, 0, "Hoja 1", file_vino1, api_key)
     elif not api_key:
         st.warning("Introduce tu API key arriba para continuar.")
 
 # ---- TAB 2: Finca ----
 with tab2:
-    st.subheader("Finca — Hoja 'FINCA' del excel de etiquetas")
+    st.subheader("Finca — Hoja 2 del excel de etiquetas")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**📋 Excel de etiquetas**")
@@ -252,6 +253,6 @@ with tab2:
         file_vino2 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino2")
 
     if file_etq2 and file_vino2 and api_key:
-        run_matching("finca", file_etq2, "FINCA", file_vino2, api_key)
+        run_matching("finca", file_etq2, 1, "FINCA", file_vino2, api_key)
     elif not api_key:
         st.warning("Introduce tu API key arriba para continuar.")
