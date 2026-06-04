@@ -12,16 +12,11 @@ st.markdown("La IA relaciona las ETQ/CONTRA (col. B etiquetas) con los vinos (co
 
 api_key = st.text_input("🔑 API Key de Anthropic (sk-ant-...)", type="password", placeholder="sk-ant-api03-...")
 
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📋 Excel de etiquetas")
-    file_etq = st.file_uploader("Col. B = nombre · Col. D = stock vino (a actualizar)", type=["xlsx", "xls"], key="etq")
-with col2:
-    st.subheader("🍾 Excel de stock de vino")
-    file_vino = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx", "xls"], key="vino")
+st.markdown("---")
+tab1, tab2 = st.tabs(["🏢 Empresa 1 (Hoja 1)", "🏡 Finca (Hoja 2)"])
 
-def parse_etq(file):
-    raw = pd.read_excel(file, header=None)
+def parse_etq(file, sheet):
+    raw = pd.read_excel(file, header=None, sheet_name=sheet)
     rows = []
     for i in range(1, len(raw)):
         name = str(raw.iloc[i, 1] if len(raw.columns) > 1 else '').strip()
@@ -68,16 +63,24 @@ def call_claude(api_key, prompt):
     data = resp.json()
     return data["content"][0]["text"].strip()
 
-if file_etq and file_vino:
+def run_matching(tab_key, file_etq, sheet_name, file_vino, api_key):
+    if not file_etq or not file_vino:
+        st.info("Carga ambos excels para continuar.")
+        return
+
     file_etq.seek(0)
     file_vino.seek(0)
-    etq_rows = parse_etq(file_etq)
-    file_vino.seek(0)
+
+    try:
+        etq_rows = parse_etq(file_etq, sheet_name)
+    except Exception as e:
+        st.error(f"Error leyendo hoja '{sheet_name}' del excel de etiquetas: {e}")
+        return
+
     vino_rows = parse_vino(file_vino)
+    st.success(f"✅ Etiquetas ({sheet_name}): **{len(etq_rows)}** artículos · Vino: **{len(vino_rows)}** vinos con stock")
 
-    st.success(f"✅ Excel etiquetas: **{len(etq_rows)}** artículos · Excel vino: **{len(vino_rows)}** vinos con stock")
-
-    if st.button("🤖 Buscar coincidencias con IA", type="primary", disabled=not api_key):
+    if st.button("🤖 Buscar coincidencias con IA", type="primary", disabled=not api_key, key=f"btn_match_{tab_key}"):
         vino_names = [v["name"] for v in vino_rows]
         etq_names = [r["name"] for r in etq_rows]
         all_results = {}
@@ -139,79 +142,116 @@ VINOS CON STOCK DISPONIBLE:
                     "conf": m.get("conf", "low") if vino_name else "skip"
                 })
             progress.progress(100, text="¡Completado!")
-            st.session_state["matches"] = matches
-            st.session_state["vino_rows"] = vino_rows
+            st.session_state[f"matches_{tab_key}"] = matches
+            st.session_state[f"vino_rows_{tab_key}"] = vino_rows
 
-if "matches" in st.session_state:
-    matches = st.session_state["matches"]
-    vino_rows = st.session_state["vino_rows"]
+    if f"matches_{tab_key}" in st.session_state:
+        matches = st.session_state[f"matches_{tab_key}"]
+        vino_rows_s = st.session_state[f"vino_rows_{tab_key}"]
 
-    high = sum(1 for m in matches if m["conf"] == "high")
-    mid  = sum(1 for m in matches if m["conf"] == "mid")
-    low  = sum(1 for m in matches if m["conf"] in ("low", "skip"))
+        high = sum(1 for m in matches if m["conf"] == "high")
+        mid  = sum(1 for m in matches if m["conf"] == "mid")
+        low  = sum(1 for m in matches if m["conf"] in ("low", "skip"))
 
-    st.markdown("---")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total artículos", len(matches))
-    c2.metric("✅ Coincidencia alta", high)
-    c3.metric("⚠️ Media", mid)
-    c4.metric("❌ Sin coincidencia", low)
+        st.markdown("---")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total artículos", len(matches))
+        c2.metric("✅ Coincidencia alta", high)
+        c3.metric("⚠️ Media", mid)
+        c4.metric("❌ Sin coincidencia", low)
 
-    st.markdown("### Revisa y corrige las coincidencias")
-    conf_filter = st.selectbox("Filtrar por confianza", ["Todas", "Alta", "Media", "Revisar", "Manual"])
-    search = st.text_input("Buscar etiqueta...")
+        st.markdown("### Revisa y corrige las coincidencias")
+        conf_filter = st.selectbox("Filtrar", ["Todas", "Alta", "Media", "Revisar", "Manual"], key=f"filter_{tab_key}")
+        search = st.text_input("Buscar etiqueta...", key=f"search_{tab_key}")
 
-    vino_options = ["— sin asignar —"] + [v["name"] for v in vino_rows]
-    CONF_LABELS = {"high": "✅ Alta", "mid": "⚠️ Media", "low": "❌ Revisar", "skip": "— Sin asignar", "manual": "✏️ Manual"}
-    CONF_FILTER_MAP = {"Todas": None, "Alta": "high", "Media": "mid", "Revisar": "low_skip", "Manual": "manual"}
-    cf = CONF_FILTER_MAP[conf_filter]
+        vino_options = ["— sin asignar —"] + [v["name"] for v in vino_rows_s]
+        CONF_LABELS = {"high": "✅ Alta", "mid": "⚠️ Media", "low": "❌ Revisar", "skip": "— Sin asignar", "manual": "✏️ Manual"}
+        CONF_FILTER_MAP = {"Todas": None, "Alta": "high", "Media": "mid", "Revisar": "low_skip", "Manual": "manual"}
+        cf = CONF_FILTER_MAP[conf_filter]
 
-    filtered = []
-    for i, m in enumerate(matches):
-        if search and search.lower() not in m["name"].lower():
-            continue
-        if cf == "low_skip" and m["conf"] not in ("low", "skip"):
-            continue
-        elif cf and cf != "low_skip" and m["conf"] != cf:
-            continue
-        filtered.append((i, m))
+        filtered = []
+        for i, m in enumerate(matches):
+            if search and search.lower() not in m["name"].lower():
+                continue
+            if cf == "low_skip" and m["conf"] not in ("low", "skip"):
+                continue
+            elif cf and cf != "low_skip" and m["conf"] != cf:
+                continue
+            filtered.append((i, m))
 
-    for i, m in filtered:
-        cols = st.columns([3, 1, 1, 3, 1])
-        cols[0].markdown(f"**{m['name']}**")
-        cols[1].markdown(f"`{m.get('stock_etq', '—')}`")
-        cols[2].markdown(CONF_LABELS.get(m["conf"], m["conf"]))
-        current_vino = m.get("matched_vino") or "— sin asignar —"
-        idx = vino_options.index(current_vino) if current_vino in vino_options else 0
-        selected = cols[3].selectbox("", vino_options, index=idx, key=f"sel_{i}", label_visibility="collapsed")
-        if selected != current_vino:
-            matches[i]["matched_vino"] = selected if selected != "— sin asignar —" else None
-            matches[i]["conf"] = "manual" if selected != "— sin asignar —" else "skip"
-            vino_entry = next((v for v in vino_rows if v["name"] == selected), None)
-            matches[i]["matched_stock"] = vino_entry["stock"] if vino_entry else None
-            st.session_state["matches"] = matches
-        sv = m.get("matched_stock")
-        cols[4].markdown(f"`{int(sv) if sv is not None else '—'}`")
+        for i, m in filtered:
+            cols = st.columns([3, 1, 1, 3, 1])
+            cols[0].markdown(f"**{m['name']}**")
+            cols[1].markdown(f"`{m.get('stock_etq', '—')}`")
+            cols[2].markdown(CONF_LABELS.get(m["conf"], m["conf"]))
+            current_vino = m.get("matched_vino") or "— sin asignar —"
+            idx = vino_options.index(current_vino) if current_vino in vino_options else 0
+            selected = cols[3].selectbox("", vino_options, index=idx, key=f"sel_{tab_key}_{i}", label_visibility="collapsed")
+            if selected != current_vino:
+                matches[i]["matched_vino"] = selected if selected != "— sin asignar —" else None
+                matches[i]["conf"] = "manual" if selected != "— sin asignar —" else "skip"
+                vino_entry = next((v for v in vino_rows_s if v["name"] == selected), None)
+                matches[i]["matched_stock"] = vino_entry["stock"] if vino_entry else None
+                st.session_state[f"matches_{tab_key}"] = matches
+            sv = m.get("matched_stock")
+            cols[4].markdown(f"`{int(sv) if sv is not None else '—'}`")
 
-    st.markdown("---")
-    if st.button("⬇️ Generar Excel actualizado", type="primary"):
-        if file_etq is not None:
+        st.markdown("---")
+        if st.button("⬇️ Generar Excel actualizado", type="primary", key=f"btn_download_{tab_key}"):
             file_etq.seek(0)
-            raw = pd.read_excel(file_etq, header=None)
+            # Leer todas las hojas para preservarlas
+            all_sheets = pd.read_excel(file_etq, header=None, sheet_name=None)
+            # Actualizar la hoja correspondiente
+            raw = all_sheets[sheet_name]
             updated = 0
             for m in matches:
                 if m.get("matched_stock") is not None:
                     raw.iloc[m["row_idx"] - 1, 3] = m["matched_stock"]
                     updated += 1
+            all_sheets[sheet_name] = raw
+
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                raw.to_excel(writer, index=False, header=False)
+                for sname, sdf in all_sheets.items():
+                    sdf.to_excel(writer, index=False, header=False, sheet_name=sname)
             output.seek(0)
+
             st.download_button(
-                label=f"📥 Descargar ({updated} celdas actualizadas en col. D)",
+                label=f"📥 Descargar ({updated} celdas actualizadas en col. D — hoja {sheet_name})",
                 data=output,
-                file_name="previsión_etiquetas_2026_ACTUALIZADO.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                file_name=f"previsión_etiquetas_2026_ACTUALIZADO_{tab_key}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{tab_key}"
             )
-        else:
-            st.warning("Vuelve a cargar el excel de etiquetas para poder descargar.")
+
+# ---- TAB 1: Empresa 1 ----
+with tab1:
+    st.subheader("Empresa 1 — Hoja 1 del excel de etiquetas")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**📋 Excel de etiquetas**")
+        file_etq1 = st.file_uploader("Col. B = nombre · Col. D = stock vino (a actualizar)", type=["xlsx","xls"], key="etq1")
+    with col2:
+        st.markdown("**🍾 Excel de stock de vino (Empresa 1)**")
+        file_vino1 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino1")
+
+    if file_etq1 and file_vino1 and api_key:
+        run_matching("emp1", file_etq1, 0, file_vino1, api_key)
+    elif not api_key:
+        st.warning("Introduce tu API key arriba para continuar.")
+
+# ---- TAB 2: Finca ----
+with tab2:
+    st.subheader("Finca — Hoja 'FINCA' del excel de etiquetas")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**📋 Excel de etiquetas**")
+        file_etq2 = st.file_uploader("Col. B = nombre · Col. D = stock vino (a actualizar)", type=["xlsx","xls"], key="etq2")
+    with col2:
+        st.markdown("**🍾 Excel de stock de vino (Finca)**")
+        file_vino2 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino2")
+
+    if file_etq2 and file_vino2 and api_key:
+        run_matching("finca", file_etq2, "FINCA", file_vino2, api_key)
+    elif not api_key:
+        st.warning("Introduce tu API key arriba para continuar.")
