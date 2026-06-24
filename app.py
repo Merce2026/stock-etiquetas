@@ -74,14 +74,14 @@ def run_matching(tab_key, file_etq, sheet_index, sheet_label, file_vino, api_key
     try:
         etq_rows = parse_etq(file_etq, sheet_index)
     except Exception as e:
-        st.error(f"Error leyendo hoja '{sheet_label}' del excel de etiquetas: {e}")
+        st.error(f"Error leyendo hoja '{sheet_label}': {e}")
         return
 
     vino_rows = parse_vino(file_vino)
     st.success(f"✅ Etiquetas ({sheet_label}): **{len(etq_rows)}** artículos · Vino: **{len(vino_rows)}** vinos con stock")
 
     if st.button("🤖 Buscar coincidencias con IA", type="primary", disabled=not api_key, key=f"btn_match_{tab_key}"):
-        vino_names = [v["name"] for v in vino_rows]
+        vino_lines = [f"{i}|{v['name']}" for i, v in enumerate(vino_rows)]
         etq_names = [r["name"] for r in etq_rows]
         all_results = {}
         BATCH = 35
@@ -92,29 +92,31 @@ def run_matching(tab_key, file_etq, sheet_index, sheet_label, file_vino, api_key
         for b, i in enumerate(range(0, len(etq_names), BATCH)):
             batch = etq_names[i:i+BATCH]
             pct = int((b / total_batches) * 90)
-            progress.progress(pct, text=f"Lote {b+1} de {total_batches} — artículos {i+1}–{min(i+BATCH, len(etq_names))} de {len(etq_names)}")
+            progress.progress(pct, text=f"Lote {b+1} de {total_batches} — {i+1}–{min(i+BATCH, len(etq_names))} de {len(etq_names)}")
 
-            prompt = f"""Eres experto en vinos de Ego Bodegas. Relaciona cada etiqueta/contra con el vino del inventario.
+            prompt = f"""Eres experto en vinos de Ego Bodegas. Relaciona cada etiqueta con el vino del inventario.
 
 REGLAS:
 - Ignora prefijos ETQ/CONTRA al comparar
 - "EL GORU" y "GORU" son el mismo producto
 - Los años (2022/2023/2024/2025) son importantes: intenta que coincidan
-- "LCBO" = mercado Canadá cilíndrica (12X0.75), "CA" = Canadá, "EU/Europa" = Europa
-- "6X0.75" = caja estándar, "12X0.75" = caja 12, "Bandeja 30X" = bandeja
-- Para etiquetas sin año (S/A), asigna el vino más reciente disponible
-- Si no hay ninguna coincidencia razonable pon null
-- conf: "high"=coincidencia clara, "mid"=probable, "low"=dudosa
-- El campo "vino" debe ser el nombre EXACTAMENTE igual a como aparece en la lista de abajo, sin cambiar ni una letra
+- "LCBO" = Canadá cilíndrica, "CA" = Canadá, "EU/Europa" = Europa
+- Para etiquetas sin año (S/A), asigna el más reciente disponible
+- Si no hay coincidencia razonable pon null
+- conf: "high"=clara, "mid"=probable, "low"=dudosa
 
-Responde SOLO con el JSON array sin texto ni backticks:
-[{{"etq":"nombre exacto","vino":"nombre exacto del vino o null","conf":"high/mid/low"}}]
+Los vinos tienen formato "INDICE|nombre". Debes devolver el INDICE numérico, no el nombre.
+
+Responde SOLO con JSON array sin texto ni backticks:
+[{{"etq":"nombre etiqueta","idx":0,"conf":"high/mid/low"}}]
+
+Si no hay coincidencia: {{"etq":"nombre","idx":null,"conf":"low"}}
 
 ETIQUETAS:
 {chr(10).join(batch)}
 
-VINOS CON STOCK DISPONIBLE (copia el nombre exactamente):
-{chr(10).join(vino_names)}"""
+VINOS CON STOCK (INDICE|nombre):
+{chr(10).join(vino_lines)}"""
 
             try:
                 text = call_claude(api_key, prompt)
@@ -130,15 +132,11 @@ VINOS CON STOCK DISPONIBLE (copia el nombre exactamente):
 
         if not error_found:
             progress.progress(95, text="Cruzando datos...")
-            vino_map = {v["name"]: v for v in vino_rows}
             matches = []
             for etq in etq_rows:
                 m = all_results.get(etq["name"], {})
-                vino_name = m.get("vino")
-                # Búsqueda exacta primero, luego insensible a mayúsculas
-                vino_entry = vino_map.get(vino_name)
-                if not vino_entry and vino_name:
-                    vino_entry = next((v for v in vino_rows if v["name"].strip().lower() == vino_name.strip().lower()), None)
+                idx = m.get("idx")
+                vino_entry = vino_rows[idx] if idx is not None and 0 <= idx < len(vino_rows) else None
                 matches.append({
                     **etq,
                     "matched_vino": vino_entry["name"] if vino_entry else None,
@@ -225,7 +223,6 @@ VINOS CON STOCK DISPONIBLE (copia el nombre exactamente):
                 key=f"dl_{tab_key}"
             )
 
-# ---- TAB 1: Empresa 1 ----
 with tab1:
     st.subheader("Empresa 1 — Hoja 1 del excel de etiquetas")
     col1, col2 = st.columns(2)
@@ -235,13 +232,11 @@ with tab1:
     with col2:
         st.markdown("**🍾 Excel de stock de vino (Empresa 1)**")
         file_vino1 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino1")
-
     if file_etq1 and file_vino1 and api_key:
         run_matching("emp1", file_etq1, 0, "Hoja 1", file_vino1, api_key)
     elif not api_key:
         st.warning("Introduce tu API key arriba para continuar.")
 
-# ---- TAB 2: Finca ----
 with tab2:
     st.subheader("Finca — Hoja 2 del excel de etiquetas")
     col1, col2 = st.columns(2)
@@ -251,7 +246,6 @@ with tab2:
     with col2:
         st.markdown("**🍾 Excel de stock de vino (Finca)**")
         file_vino2 = st.file_uploader("Col. C = nombre vino · Col. F = stock disponible", type=["xlsx","xls"], key="vino2")
-
     if file_etq2 and file_vino2 and api_key:
         run_matching("finca", file_etq2, 1, "FINCA", file_vino2, api_key)
     elif not api_key:
